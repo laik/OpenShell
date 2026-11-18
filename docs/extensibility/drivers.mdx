@@ -82,6 +82,8 @@ For implementation details, refer to each driver crate:
 
 External credential drivers implement [`credential_driver.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/credential_driver.proto).
 
+The in-tree Vault driver is a default-on `credential-driver-vault` build feature. See [Select Credential Drivers](/observability/telemetry#select-credential-drivers) for builds that omit it.
+
 ## Compatibility
 
 Drivers exchange peer metadata with the gateway and advertise their extension

@@ -36,6 +36,16 @@ Only the issuer's owner adapter translates internal kinds into legacy provider-s
 
 Raw resolution returns backend expiration metadata without applying provider policy. The gateway combines provider and backend expiration and withholds expired values. Refresh material has no provider expiration and retains its existing zero-time backend-expiration cutoff.
 
+## Build features
+
+`credential-driver-vault` (default on) compiles in the in-tree Vault driver and
+its `openshell-driver-vault` dependency. `openshell-server` and
+`openshell-gateway` forward the same feature name. A build that omits it
+rejects `credential_drivers = ["vault"]` with an unsupported-build error that
+names the feature and the `transport = "uds"` escape hatch; the default
+encrypted database store, Kubernetes Secrets, and the driver-agnostic UDS
+transport are unaffected.
+
 ## Tests
 
 Issuer tests cover built-in token exchanges/error classification, refresh commit uncertainty and cleanup, cross-runtime cancellation/coalescing, registry/configuration/transport behavior, owner translation, storage batching, response correlation, and material-key compatibility. The existing server tests continue to cover provider orchestration, refresh races/recovery, credential export, SSH identity, launch material, and delivery through the extracted implementation.
@@ -45,6 +55,9 @@ The `test-support` feature exposes the existing static backend and deterministic
 ```shell
 cargo test -p openshell-credential-issuer
 cargo test -p openshell-server --features test-support
+# Vault-omitted build: unsupported-build errors and unaffected defaults.
+cargo test -p openshell-credential-issuer --no-default-features
+cargo test -p openshell-server --no-default-features --features telemetry --lib credentials::tests:: -- --skip grpc::
 ```
 
 No new e2e suite or runtime artifact is needed. Versioned references, durable migration, remote RPCs, authentication, watches/caching, and service packaging remain later RFC 0023 work.

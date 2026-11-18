@@ -694,13 +694,67 @@ mod tests {
             BuiltinCredentialDriverKind::from_name("openshell-gateway"),
             None
         );
+        #[cfg(feature = "credential-driver-vault")]
         assert_eq!(
             BuiltinCredentialDriverKind::from_name("vault"),
             Some(BuiltinCredentialDriverKind::Vault)
         );
+        #[cfg(not(feature = "credential-driver-vault"))]
+        assert_eq!(BuiltinCredentialDriverKind::from_name("vault"), None);
         assert_eq!(
             BuiltinCredentialDriverKind::from_name("enterprise-secrets"),
             None
+        );
+    }
+
+    #[cfg(not(feature = "credential-driver-vault"))]
+    #[test]
+    fn omitted_vault_build_rejects_vault_with_unsupported_build_error() {
+        let config = Config::new(None).with_credential_drivers(["vault"]);
+
+        let err = EmbeddedCredentialIssuer::from_config(&IssuerConfig::from(&config)).unwrap_err();
+
+        assert!(err.to_string().contains("not included in this build"));
+        assert!(err.to_string().contains("credential-driver-vault"));
+        assert!(err.to_string().contains("transport = 'uds'"));
+    }
+
+    #[cfg(not(feature = "credential-driver-vault"))]
+    #[tokio::test]
+    async fn omitted_vault_build_rejects_in_tree_vault_table() {
+        let config = Config::new(None).with_credential_drivers(["vault"]);
+        let mut driver_configs = BTreeMap::new();
+        driver_configs.insert(
+            "vault".to_string(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "transport".to_string(),
+                toml::Value::String("in_tree".to_string()),
+            )])),
+        );
+        let issuer_config = IssuerConfig {
+            driver_configs,
+            ..IssuerConfig::from(&config)
+        };
+
+        let err = EmbeddedCredentialIssuer::from_options(&issuer_config, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not included in this build"));
+        assert!(err.to_string().contains("credential-driver-vault"));
+    }
+
+    #[cfg(not(feature = "credential-driver-vault"))]
+    #[test]
+    fn omitted_vault_build_keeps_default_store_and_other_driver_names() {
+        let registry = CredentialDriverRegistry::from_config(&IssuerConfig::default()).unwrap();
+        assert_eq!(
+            registry.storage_owner_name().as_str(),
+            DbCredstoreCredentialDriver::NAME
+        );
+        assert!(
+            !builtin_credential_driver_names().contains(&"vault"),
+            "omitted builds must not advertise vault as built-in"
         );
     }
 

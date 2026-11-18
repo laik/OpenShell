@@ -596,6 +596,24 @@ jobs:
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
           cargo nextest run --locked --profile ci -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
 
+      - name: Verify Vault credential driver compiles out
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-gateway --edges normal,build --prefix none > /tmp/openshell-gateway-default-dependencies.txt
+          if ! grep -Eq '^openshell-driver-vault v' /tmp/openshell-gateway-default-dependencies.txt; then
+            echo "ERROR: default gateway build is missing the in-tree Vault driver" >&2
+            exit 1
+          fi
+          cargo build --locked -p openshell-gateway --bin openshell-gateway --no-default-features --features compute-driver-docker,telemetry
+          cargo tree --locked -p openshell-gateway --no-default-features --features compute-driver-docker,telemetry --edges normal,build --prefix none > /tmp/openshell-gateway-vault-free-dependencies.txt
+          if grep -Eq '^openshell-driver-vault v' /tmp/openshell-gateway-vault-free-dependencies.txt; then
+            echo "ERROR: openshell-driver-vault found in vault-free gateway build" >&2
+            cat /tmp/openshell-gateway-vault-free-dependencies.txt >&2
+            exit 1
+          fi
+          cargo nextest run --locked --profile ci -p openshell-credential-issuer --no-default-features
+          cargo test --locked -p openshell-server --no-default-features --features telemetry --lib credentials::tests:: -- --skip grpc::
+
   rust-gateway-extended-features:
     name: Rust gateway extended features
     needs: pr_metadata

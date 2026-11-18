@@ -366,6 +366,7 @@ mod tests {
     use std::path::Path;
     use tonic::Code;
 
+    #[cfg(feature = "credential-driver-vault")]
     fn provider_with_handle(driver: &str, handle: &str) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::ObjectMeta {
@@ -724,6 +725,7 @@ backend_specific = "ignored-by-gateway"
         );
     }
 
+    #[cfg(feature = "credential-driver-vault")]
     #[tokio::test]
     async fn runtime_uses_configured_vault_in_tree_driver_table() {
         let token_file = tempfile::NamedTempFile::new().unwrap();
@@ -832,6 +834,29 @@ transport = "in_tree"
         assert!(err.to_string().contains("no in-tree implementation"));
     }
 
+    #[cfg(not(feature = "credential-driver-vault"))]
+    #[tokio::test]
+    async fn runtime_rejects_vault_when_build_omits_it() {
+        let config = Config::new(None).with_credential_drivers(["vault"]);
+
+        let err = CredentialRuntime::from_config(&config).unwrap_err();
+        assert!(err.to_string().contains("not included in this build"));
+        assert!(err.to_string().contains("credential-driver-vault"));
+        assert!(err.to_string().contains("transport = 'uds'"));
+
+        let file = config_file(
+            r#"
+[openshell.credential_drivers.vault]
+transport = "in_tree"
+"#,
+        );
+        let err = CredentialRuntime::from_config_file(&config, Some(&file))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not included in this build"));
+        assert!(err.to_string().contains("credential-driver-vault"));
+    }
+
     #[tokio::test]
     async fn runtime_rejects_unknown_driver_without_driver_table() {
         let config = Config::new(None).with_credential_drivers(["enterprise-secrets"]);
@@ -905,6 +930,7 @@ transport = "tcp"
         assert!(err.to_string().contains("transport must be"));
     }
 
+    #[cfg(feature = "credential-driver-vault")]
     #[tokio::test]
     async fn runtime_rejects_unconnected_enabled_driver_on_resolution() {
         let config = Config::new(None).with_credential_drivers(["vault"]);

@@ -51,3 +51,14 @@ cargo build --release -p openshell-gateway --no-default-features --features tele
 ```
 
 Regular builds keep their platform driver set through the default `in-tree-compute-drivers` compatibility feature. On Windows, `compute-driver-mxc` selects MXC and the other four features install unsupported-driver stubs. On other platforms, MXC is excluded.
+
+### Select Credential Drivers
+
+The in-tree Vault credential driver is a default-on `credential-driver-vault` Cargo feature. Omit it to build a gateway without Vault credential storage:
+
+```shell
+# Docker only, with telemetry support and no in-tree Vault credential driver.
+cargo build --release -p openshell-gateway --no-default-features --features telemetry,compute-driver-docker
+```
+
+The resulting gateway keeps its default encrypted database credential store and the Kubernetes Secrets driver. Configuring `credential_drivers = ["vault"]` in this build fails at startup with an unsupported-build error. An external Vault driver over `transport = "uds"` still works because the UDS transport is driver-agnostic. Default builds and the `defaults-without-telemetry` alias keep Vault support; add `credential-driver-vault` explicitly to re-enable it in a selective build.

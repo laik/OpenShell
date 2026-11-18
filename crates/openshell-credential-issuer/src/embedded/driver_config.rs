@@ -15,6 +15,7 @@ use openshell_core::proto::CredentialHandle;
 use openshell_core::{Error, Result as CoreResult};
 use openshell_driver_db_credstore::{DbCredstoreCredentialDriver, DbCredstoreObjectStore};
 use openshell_driver_kubernetes_secrets::KubernetesSecretsCredentialDriver;
+#[cfg(feature = "credential-driver-vault")]
 use openshell_driver_vault::VaultCredentialDriver;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ const COMMON_CREDENTIAL_DRIVER_FIELDS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BuiltinCredentialDriverKind {
     KubernetesSecrets,
+    #[cfg(feature = "credential-driver-vault")]
     Vault,
     #[cfg(any(test, feature = "test-support"))]
     TestStatic,
@@ -41,6 +43,7 @@ impl BuiltinCredentialDriverKind {
     pub(super) fn from_name(name: &str) -> Option<Self> {
         match name {
             KubernetesSecretsCredentialDriver::NAME => Some(Self::KubernetesSecrets),
+            #[cfg(feature = "credential-driver-vault")]
             VaultCredentialDriver::NAME => Some(Self::Vault),
             #[cfg(any(test, feature = "test-support"))]
             TestStaticCredentialDriver::NAME => Some(Self::TestStatic),
@@ -49,24 +52,33 @@ impl BuiltinCredentialDriverKind {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(super) fn builtin_credential_driver_names() -> &'static [&'static str] {
     &[
         KubernetesSecretsCredentialDriver::NAME,
+        #[cfg(feature = "credential-driver-vault")]
         VaultCredentialDriver::NAME,
+        #[cfg(any(test, feature = "test-support"))]
         TestStaticCredentialDriver::NAME,
     ]
 }
 
-#[cfg(not(any(test, feature = "test-support")))]
-pub(super) fn builtin_credential_driver_names() -> &'static [&'static str] {
-    &[
-        KubernetesSecretsCredentialDriver::NAME,
-        VaultCredentialDriver::NAME,
-    ]
+/// Error for a built-in driver whose support was compiled out of this build.
+/// Returns `None` when the driver is not a known-but-omitted built-in.
+pub(super) fn omitted_credential_driver_error(driver_name: &str) -> Option<Error> {
+    #[cfg(not(feature = "credential-driver-vault"))]
+    if driver_name == "vault" {
+        return Some(Error::config(
+            "credential driver 'vault' is not included in this build; rebuild with the 'credential-driver-vault' feature or configure an external Vault driver with transport = 'uds'",
+        ));
+    }
+    let _ = driver_name;
+    None
 }
 
 pub(super) fn unknown_credential_driver_error(driver_name: &str) -> Error {
+    if let Some(error) = omitted_credential_driver_error(driver_name) {
+        return error;
+    }
     Error::config(format!(
         "credential driver '{driver_name}' is not a built-in credential driver and has no [openshell.credential_drivers.{driver_name}] table; configure an external driver with transport = 'uds' or choose one of: {}",
         builtin_credential_driver_names().join(", ")
@@ -422,9 +434,11 @@ pub(super) async fn build_configured_driver(
             let driver = build_in_tree_driver(driver_name, Some(&config.backend_config), store)
                 .await?
                 .ok_or_else(|| {
-                    Error::config(format!(
-                        "credential driver '{driver_name}' is configured with transport = 'in_tree', but no in-tree implementation is available"
-                    ))
+                    omitted_credential_driver_error(driver_name).unwrap_or_else(|| {
+                        Error::config(format!(
+                            "credential driver '{driver_name}' is configured with transport = 'in_tree', but no in-tree implementation is available"
+                        ))
+                    })
                 })?;
             Ok(BuiltCredentialDriver {
                 driver,
@@ -466,6 +480,7 @@ pub(super) async fn build_in_tree_driver(
         BuiltinCredentialDriverKind::KubernetesSecrets => {
             Arc::new(KubernetesSecretsCredentialDriver::from_config(backend_config).await?)
         }
+        #[cfg(feature = "credential-driver-vault")]
         BuiltinCredentialDriverKind::Vault => {
             Arc::new(VaultCredentialDriver::from_config(backend_config)?)
         }
