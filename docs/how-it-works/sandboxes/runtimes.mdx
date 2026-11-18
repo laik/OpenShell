@@ -321,9 +321,9 @@ After upgrading Agent Sandbox, restart the gateway.
 Workspace storage settings cannot change after a sandbox is created. Delete and recreate the sandbox to change them.
 </Note>
 
-### Kubernetes PVC Mounts
+### Kubernetes Volume Mounts
 
-Mount existing PersistentVolumeClaims into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace PVC for that sandbox.
+Mount existing PersistentVolumeClaims, ConfigMaps, and Secrets into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace PVC for that sandbox. Each volume selects exactly one source. ConfigMap and Secret volumes are always read-only and resolve from the sandbox namespace; the gateway reads their metadata for admission, never their data.
 
 ```shell
 openshell sandbox create \
@@ -351,10 +351,41 @@ openshell sandbox create \
 | `volumes[].name` | Volume name. |
 | `volumes[].persistent_volume_claim.claim_name` | Existing PVC in the sandbox namespace. |
 | `volumes[].persistent_volume_claim.read_only` | Defaults to `true`. |
+| `volumes[].config_map.name` | Existing ConfigMap in the sandbox namespace. |
+| `volumes[].secret.secret_name` | Existing Secret in the sandbox namespace. |
+| `volumes[].config_map.items` / `volumes[].secret.items` | Optional `key`/`path` projections with an optional octal `mode`. |
+| `volumes[].config_map.default_mode` / `volumes[].secret.default_mode` | Optional octal file mode, `0000`–`0777`. |
+| `volumes[].config_map.optional` / `volumes[].secret.optional` | Defaults to `false`. When `true`, a missing object does not block pod startup. |
 | `containers.agent.volume_mounts[].name` | Volume to mount. |
 | `containers.agent.volume_mounts[].mount_path` | Absolute path in the agent container. |
-| `containers.agent.volume_mounts[].sub_path` | Optional relative path within the PVC. |
-| `containers.agent.volume_mounts[].read_only` | Defaults to `true`. Read-write mounts require a read-write volume. |
+| `containers.agent.volume_mounts[].sub_path` | Optional relative path within the volume. |
+| `containers.agent.volume_mounts[].read_only` | Defaults to `true`. Read-write mounts require a read-write PVC volume. |
+
+Mount a ConfigMap as application configuration and a Secret as read-only files:
+
+```shell
+openshell sandbox create \
+  --from registry.example.com/team/agent:1.0 \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [
+        {"name": "agent-config", "config_map": {"name": "agent-config"}},
+        {"name": "agent-secrets", "secret": {"secret_name": "agent-extra"}}
+      ],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {"name": "agent-config", "mount_path": "/etc/agent"},
+            {"name": "agent-secrets", "mount_path": "/etc/agent-secrets"}
+          ]
+        }
+      }
+    }
+  }' \
+  -- agent
+```
+
+Label both objects for [resource admission](/how-it-works/gateways/configuration#external-resource-admission) before use. For API keys and tokens that the gateway should resolve and inject without exposing values to the caller, prefer a [credential provider](/how-it-works/providers/overview) over a Secret volume.
 
 ## Sandbox User Identity
 

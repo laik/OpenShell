@@ -93,7 +93,7 @@ tests:
             resources: ["configmaps"]
             verbs: ["get"]
 
-  - it: grants PVC admission reads only when caller driver config is enabled
+  - it: grants attachment admission reads only when caller driver config is enabled
     template: templates/role.yaml
     set:
       server.drivers.kubernetes.allowDriverConfig: true
@@ -102,7 +102,7 @@ tests:
           path: rules
           content:
             apiGroups: [""]
-            resources: ["persistentvolumeclaims"]
+            resources: ["persistentvolumeclaims", "configmaps", "secrets"]
             verbs: ["get"]
 
   - it: omits shared-workspace resources for the deprecated managed workspace mode

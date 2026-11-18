@@ -16,9 +16,10 @@ metadata:
 rules:
   {{- if include "openshell.workspaceResourcesEnabled" . }}
   {{- if $allowDriverConfig }}
-  # Metadata-only admission of caller-selected PVCs requires get permission.
+  # Metadata-only admission of caller-selected PVC, ConfigMap, and Secret
+  # attachments requires get permission.
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
+    resources: ["persistentvolumeclaims", "configmaps", "secrets"]
     verbs: ["get"]
   {{- end }}
   - apiGroups:

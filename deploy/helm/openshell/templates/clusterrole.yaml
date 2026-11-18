@@ -26,8 +26,10 @@ rules:
     resources: ["priorityclasses"]
     verbs: ["get"]
   {{- if and (ne $workspaceMode "shared") $allowDriverConfig }}
+  # Metadata-only admission of caller-selected PVC, ConfigMap, and Secret
+  # attachments requires get permission in workspace namespaces.
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
+    resources: ["persistentvolumeclaims", "configmaps", "secrets"]
     verbs: ["get"]
   {{- end }}
   # Validate projected ServiceAccount tokens during sandbox bootstrap and
