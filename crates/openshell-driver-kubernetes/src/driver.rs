@@ -31,8 +31,9 @@ use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod,
-    Secret, Service, ServiceAccount, Volume, VolumeMount,
+    ConfigMap, ConfigMapVolumeSource, Event as KubeEventObj, KeyToPath, Namespace, Node,
+    PersistentVolumeClaimVolumeSource, Pod, Secret, SecretVolumeSource, Service, ServiceAccount,
+    Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -768,6 +769,92 @@ struct KubernetesContainerResourceConfig {
 struct KubernetesDriverVolumeConfig {
     name: String,
     persistent_volume_claim: KubernetesPersistentVolumeClaimConfig,
+    config_map: KubernetesConfigMapVolumeConfig,
+    secret: KubernetesSecretVolumeConfig,
+}
+
+impl KubernetesDriverVolumeConfig {
+    /// ConfigMap and Secret volumes are always read-only; only PVC volumes
+    /// honor a caller-selected read/write mode.
+    fn is_read_only(&self) -> bool {
+        self.config_map.is_selected()
+            || self.secret.is_selected()
+            || self.persistent_volume_claim.read_only
+    }
+}
+
+/// Selects a namespace-local ConfigMap as a read-only volume source. The
+/// kubelet mounts the data; the gateway only reads object metadata during
+/// resource admission.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KubernetesConfigMapVolumeConfig {
+    name: String,
+    items: Vec<KubernetesKeyToPathConfig>,
+    optional: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_mode")]
+    default_mode: Option<i32>,
+}
+
+impl KubernetesConfigMapVolumeConfig {
+    fn is_selected(&self) -> bool {
+        !self.name.is_empty()
+    }
+}
+
+/// Selects a namespace-local Secret as a read-only volume source. Admission
+/// resolves metadata only; secret values never pass through the gateway.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KubernetesSecretVolumeConfig {
+    secret_name: String,
+    items: Vec<KubernetesKeyToPathConfig>,
+    optional: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_mode")]
+    default_mode: Option<i32>,
+}
+
+impl KubernetesSecretVolumeConfig {
+    fn is_selected(&self) -> bool {
+        !self.secret_name.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KubernetesKeyToPathConfig {
+    key: String,
+    path: String,
+    #[serde(default, deserialize_with = "deserialize_optional_mode")]
+    mode: Option<i32>,
+}
+
+/// File modes arrive as protobuf Struct numbers (f64) on the driver-config
+/// path; accept integral floats as well as plain integers.
+fn deserialize_optional_mode<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Number(number)) = value else {
+        return if value.is_none() {
+            Ok(None)
+        } else {
+            Err(serde::de::Error::custom("mode must be an integer"))
+        };
+    };
+    if let Some(integer) = number.as_i64() {
+        return i32::try_from(integer)
+            .map(Some)
+            .map_err(serde::de::Error::custom);
+    }
+    if let Some(float) = number.as_f64()
+        && float.fract() == 0.0
+        && (i32::MIN as f64..=i32::MAX as f64).contains(&float)
+    {
+        return Ok(Some(float as i32));
+    }
+    Err(serde::de::Error::custom("mode must be an integer"))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -806,16 +893,51 @@ impl Default for KubernetesDriverVolumeMountConfig {
     }
 }
 
+impl From<&KubernetesKeyToPathConfig> for KeyToPath {
+    fn from(item: &KubernetesKeyToPathConfig) -> Self {
+        Self {
+            key: item.key.clone(),
+            path: item.path.clone(),
+            mode: item.mode,
+        }
+    }
+}
+
 impl From<&KubernetesDriverVolumeConfig> for Volume {
     fn from(volume: &KubernetesDriverVolumeConfig) -> Self {
-        Self {
+        let mut result = Self {
             name: volume.name.clone(),
-            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+            ..Default::default()
+        };
+        if volume.config_map.is_selected() {
+            result.config_map = Some(ConfigMapVolumeSource {
+                name: volume.config_map.name.clone(),
+                items: if volume.config_map.items.is_empty() {
+                    None
+                } else {
+                    Some(volume.config_map.items.iter().map(Into::into).collect())
+                },
+                default_mode: volume.config_map.default_mode,
+                optional: Some(volume.config_map.optional),
+            });
+        } else if volume.secret.is_selected() {
+            result.secret = Some(SecretVolumeSource {
+                secret_name: Some(volume.secret.secret_name.clone()),
+                items: if volume.secret.items.is_empty() {
+                    None
+                } else {
+                    Some(volume.secret.items.iter().map(Into::into).collect())
+                },
+                default_mode: volume.secret.default_mode,
+                optional: Some(volume.secret.optional),
+            });
+        } else {
+            result.persistent_volume_claim = Some(PersistentVolumeClaimVolumeSource {
                 claim_name: volume.persistent_volume_claim.claim_name.clone(),
                 read_only: Some(volume.persistent_volume_claim.read_only),
-            }),
-            ..Default::default()
+            });
         }
+        result
     }
 }
 
@@ -872,10 +994,84 @@ fn validate_kubernetes_driver_volumes(
                 "duplicate kubernetes driver_config volume '{name}'"
             ));
         }
-        validate_kubernetes_dns1123_subdomain(
-            &volume.persistent_volume_claim.claim_name,
-            "volumes[].persistent_volume_claim.claim_name",
-        )?;
+        let selected = [
+            !volume.persistent_volume_claim.claim_name.is_empty(),
+            volume.config_map.is_selected(),
+            volume.secret.is_selected(),
+        ];
+        if selected.iter().filter(|selected| **selected).count() != 1 {
+            return Err(format!(
+                "volume '{name}' must select exactly one source: persistent_volume_claim.claim_name, config_map.name, or secret.secret_name"
+            ));
+        }
+        if !volume.persistent_volume_claim.claim_name.is_empty() {
+            validate_kubernetes_dns1123_subdomain(
+                &volume.persistent_volume_claim.claim_name,
+                "volumes[].persistent_volume_claim.claim_name",
+            )?;
+        }
+        if volume.config_map.is_selected() {
+            validate_kubernetes_dns1123_subdomain(
+                &volume.config_map.name,
+                "volumes[].config_map.name",
+            )?;
+            validate_kubernetes_key_to_path_items(
+                &volume.config_map.items,
+                "volumes[].config_map.items",
+            )?;
+            validate_kubernetes_volume_mode(
+                volume.config_map.default_mode,
+                "volumes[].config_map.default_mode",
+            )?;
+        }
+        if volume.secret.is_selected() {
+            validate_kubernetes_dns1123_subdomain(
+                &volume.secret.secret_name,
+                "volumes[].secret.secret_name",
+            )?;
+            validate_kubernetes_key_to_path_items(&volume.secret.items, "volumes[].secret.items")?;
+            validate_kubernetes_volume_mode(
+                volume.secret.default_mode,
+                "volumes[].secret.default_mode",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_key_to_path_items(
+    items: &[KubernetesKeyToPathConfig],
+    field: &str,
+) -> Result<(), String> {
+    let mut paths = HashSet::new();
+    for item in items {
+        if item.key.is_empty() {
+            return Err(format!("{field}[].key must not be empty"));
+        }
+        if item.path.is_empty()
+            || item.path.starts_with('/')
+            || item.path.contains("//")
+            || item.path.split('/').any(|segment| segment == "..")
+        {
+            return Err(format!(
+                "{field}[].path must be a relative path without '..' segments"
+            ));
+        }
+        if !paths.insert(item.path.as_str()) {
+            return Err(format!("{field} contains duplicate path '{}'", item.path));
+        }
+        validate_kubernetes_volume_mode(item.mode, &format!("{field}[].mode"))?;
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_volume_mode(mode: Option<i32>, field: &str) -> Result<(), String> {
+    if let Some(mode) = mode
+        && !(0..=0o777).contains(&mode)
+    {
+        return Err(format!(
+            "{field} must be an octal permission between 0000 and 0777"
+        ));
     }
     Ok(())
 }
@@ -886,10 +1082,7 @@ fn validate_kubernetes_driver_volume_mounts(
 ) -> Result<(), String> {
     let mut volume_read_only = BTreeMap::new();
     for volume in volumes {
-        volume_read_only.insert(
-            volume.name.as_str(),
-            volume.persistent_volume_claim.read_only,
-        );
+        volume_read_only.insert(volume.name.as_str(), volume.is_read_only());
     }
 
     let mut mount_paths = HashSet::new();
@@ -903,7 +1096,7 @@ fn validate_kubernetes_driver_volume_mounts(
         };
         if *volume_is_read_only && !mount.read_only {
             return Err(format!(
-                "volume mount '{volume_name}' cannot set read_only=false because the PVC volume is read_only=true"
+                "volume mount '{volume_name}' cannot set read_only=false because the volume is read-only"
             ));
         }
 
@@ -979,15 +1172,23 @@ fn validate_kubernetes_protected_mount_target(
     Ok(())
 }
 
-/// Recheck caller PVC destinations in saved Pod templates before restart or release.
-fn validate_stored_kubernetes_pvc_mounts(spec: &serde_json::Value) -> Result<(), String> {
+/// Recheck caller attachment destinations (PVC, ConfigMap, Secret) in saved
+/// Pod templates before restart or release.
+fn validate_stored_kubernetes_attachment_mounts(spec: &serde_json::Value) -> Result<(), String> {
     let caller_volumes: HashSet<_> = spec["volumes"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|volume| !volume["persistentVolumeClaim"].is_null())
+        .filter(|volume| {
+            !volume["persistentVolumeClaim"].is_null()
+                || !volume["configMap"].is_null()
+                || !volume["secret"].is_null()
+        })
         .filter_map(|volume| volume["name"].as_str())
-        .filter(|name| *name != WORKSPACE_VOLUME_NAME)
+        .filter(|name| {
+            *name != WORKSPACE_VOLUME_NAME
+                && !KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES.contains(name)
+        })
         .collect();
     for container in spec["containers"].as_array().into_iter().flatten() {
         for mount in container["volumeMounts"].as_array().into_iter().flatten() {
@@ -999,7 +1200,7 @@ fn validate_stored_kubernetes_pvc_mounts(spec: &serde_json::Value) -> Result<(),
             }
             let target = mount["mountPath"]
                 .as_str()
-                .ok_or("caller PVC mount lacks a mountPath")?;
+                .ok_or("caller volume mount lacks a mountPath")?;
             driver_mounts::validate_container_mount_target(target)?;
             driver_mounts::validate_workspace_mount_target(
                 target,
@@ -2171,7 +2372,7 @@ impl KubernetesComputeDriver {
     }
 
     async fn admit_stored_resources(&self, object: &DynamicObject) -> Result<(), tonic::Status> {
-        validate_stored_kubernetes_pvc_mounts(&object.data["spec"]["podTemplate"]["spec"])
+        validate_stored_kubernetes_attachment_mounts(&object.data["spec"]["podTemplate"]["spec"])
             .map_err(tonic::Status::failed_precondition)?;
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
@@ -11329,6 +11530,244 @@ mod tests {
     }
 
     #[test]
+    fn driver_config_renders_configmap_volume_read_only() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "agent-config",
+                    "config_map": {
+                        "name": "opencode-config",
+                        "items": [{"key": "opencode.json", "path": "opencode.json"}],
+                        "default_mode": 420
+                    }
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [{
+                            "name": "agent-config",
+                            "mount_path": "/etc/opencode"
+                        }]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let cr = sandbox_to_k8s_spec_for_test(
+            Some(&SandboxSpec {
+                template: Some(template),
+                ..SandboxSpec::default()
+            }),
+            &SandboxPodParams::default(),
+        );
+        let pod = &cr["spec"]["podTemplate"]["spec"];
+        let volume = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "agent-config")
+            .expect("configMap volume should be rendered");
+        assert_eq!(volume["configMap"]["name"], "opencode-config");
+        assert_eq!(volume["configMap"]["items"][0]["key"], "opencode.json");
+        assert_eq!(volume["configMap"]["defaultMode"], 420);
+        assert!(volume["persistentVolumeClaim"].is_null());
+        let mount = pod["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["name"] == "agent-config")
+            .expect("configMap mount should be rendered");
+        assert_eq!(mount["mountPath"], "/etc/opencode");
+        assert_eq!(mount["readOnly"], true);
+    }
+
+    #[test]
+    fn driver_config_renders_secret_volume_read_only() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "agent-secrets",
+                    "secret": {"secret_name": "opencode-extra"}
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [{
+                            "name": "agent-secrets",
+                            "mount_path": "/etc/opencode-secrets"
+                        }]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let cr = sandbox_to_k8s_spec_for_test(
+            Some(&SandboxSpec {
+                template: Some(template),
+                ..SandboxSpec::default()
+            }),
+            &SandboxPodParams::default(),
+        );
+        let pod = &cr["spec"]["podTemplate"]["spec"];
+        let volume = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == "agent-secrets")
+            .expect("secret volume should be rendered");
+        assert_eq!(volume["secret"]["secretName"], "opencode-extra");
+        assert!(volume["configMap"].is_null());
+        let mount = pod["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["name"] == "agent-secrets")
+            .expect("secret mount should be rendered");
+        assert_eq!(mount["readOnly"], true);
+    }
+
+    #[test]
+    fn driver_config_rejects_multiple_volume_sources() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "mixed",
+                    "persistent_volume_claim": {"claim_name": "pvc-a"},
+                    "config_map": {"name": "cm-a"}
+                }]
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+        assert!(err.contains("exactly one source"));
+    }
+
+    #[test]
+    fn driver_config_rejects_volume_without_source() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{"name": "sourceless"}]
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+        assert!(err.contains("exactly one source"));
+    }
+
+    #[test]
+    fn driver_config_rejects_writable_configmap_or_secret_mount() {
+        for source in [
+            serde_json::json!({"config_map": {"name": "cm-a"}}),
+            serde_json::json!({"secret": {"secret_name": "secret-a"}}),
+        ] {
+            let mut volume = serde_json::json!({"name": "data"});
+            volume
+                .as_object_mut()
+                .unwrap()
+                .extend(source.as_object().unwrap().clone());
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [volume],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "data",
+                                "mount_path": "/etc/data",
+                                "read_only": false
+                            }]
+                        }
+                    }
+                }))),
+                ..SandboxTemplate::default()
+            };
+
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+            assert!(err.contains("cannot set read_only=false"), "{err}");
+        }
+    }
+
+    #[test]
+    fn driver_config_rejects_invalid_key_to_path_and_modes() {
+        for (items, default_mode, expected) in [
+            (
+                serde_json::json!([{"key": "k", "path": "../escape"}]),
+                serde_json::json!(null),
+                "relative path",
+            ),
+            (
+                serde_json::json!([{"key": "k", "path": "/absolute"}]),
+                serde_json::json!(null),
+                "relative path",
+            ),
+            (
+                serde_json::json!([{"key": "", "path": "ok"}]),
+                serde_json::json!(null),
+                "must not be empty",
+            ),
+            (
+                serde_json::json!([{"key": "a", "path": "dup"}, {"key": "b", "path": "dup"}]),
+                serde_json::json!(null),
+                "duplicate path",
+            ),
+            (
+                serde_json::json!([{"key": "k", "path": "ok", "mode": 512}]),
+                serde_json::json!(null),
+                "octal permission",
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!(512),
+                "octal permission",
+            ),
+        ] {
+            let mut config_map = serde_json::json!({"name": "cm-a"});
+            config_map["items"] = items;
+            if !default_mode.is_null() {
+                config_map["default_mode"] = default_mode;
+            }
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{"name": "data", "config_map": config_map}]
+                }))),
+                ..SandboxTemplate::default()
+            };
+
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn driver_config_rejects_invalid_configmap_or_secret_object_names() {
+        for source in [
+            serde_json::json!({"config_map": {"name": "Bad_Name"}}),
+            serde_json::json!({"secret": {"secret_name": "Bad_Name"}}),
+        ] {
+            let mut volume = serde_json::json!({"name": "data"});
+            volume
+                .as_object_mut()
+                .unwrap()
+                .extend(source.as_object().unwrap().clone());
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [volume]
+                }))),
+                ..SandboxTemplate::default()
+            };
+
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+            assert!(err.contains("DNS-1123 subdomain"), "{err}");
+        }
+    }
+
+    #[test]
     fn driver_config_accepts_dns1123_subdomain_pvc_claim_name() {
         let template = SandboxTemplate {
             driver_config: Some(json_struct(serde_json::json!({
@@ -11626,7 +12065,8 @@ mod tests {
         ));
         let mut saved = DynamicObject::new("saved-mount", &resource);
         saved.data = rendered;
-        validate_stored_kubernetes_pvc_mounts(&saved.data["spec"]["podTemplate"]["spec"]).unwrap();
+        validate_stored_kubernetes_attachment_mounts(&saved.data["spec"]["podTemplate"]["spec"])
+            .unwrap();
         for enabled in [true, false] {
             let mut config = KubernetesComputeConfig {
                 allow_driver_config: true,

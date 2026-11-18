@@ -1278,13 +1278,14 @@ metadata:
     openshell.ai/sandbox-attachable-workspace: "team-a"
 ```
 
-Kubernetes checks caller-selected PVCs, RuntimeClasses, and PriorityClasses
-through the OpenShell-owned Pod template. Docker and Podman check engine volume
-labels. Read-only mounts still require approval. Namespaces do not grant
-approval. Newly provisioned private storage and bootstrap material use driver
-ownership checks instead.
+Kubernetes checks caller-selected PVCs, ConfigMaps, Secrets, RuntimeClasses,
+and PriorityClasses through the OpenShell-owned Pod template. Admission reads
+object metadata only; Secret values never pass through the gateway. Docker and
+Podman check engine volume labels. Read-only mounts still require approval.
+Namespaces do not grant approval. Newly provisioned private storage and
+bootstrap material use driver ownership checks instead.
 
-Kubernetes PVC mount destinations must not overlap the driver-managed
+Kubernetes caller volume mount destinations must not overlap the driver-managed
 `/.openshell` tree or `/run`, including mounts using `sub_path`. Approval labels
 do not override these restrictions. Mount application data at paths such as
 `/data` or a directory below `/sandbox`.

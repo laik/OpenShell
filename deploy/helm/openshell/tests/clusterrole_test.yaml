@@ -26,7 +26,7 @@ tests:
             resources: ["networkpolicies"]
             verbs: ["get", "create", "patch", "update"]
 
-  - it: limits namespaced admission reads to PVCs
+  - it: grants metadata-only admission reads for caller attachments
     set:
       server.drivers.kubernetes.workspaceMode: managed
       server.drivers.kubernetes.allowDriverConfig: true
@@ -35,22 +35,16 @@ tests:
           path: rules
           content:
             apiGroups: [""]
-            resources: ["persistentvolumeclaims"]
+            resources: ["persistentvolumeclaims", "configmaps", "secrets"]
             verbs: ["get"]
       - notContains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["get"]
-      - notContains:
-          path: rules
-          content:
-            apiGroups: [""]
-            resources: ["configmaps"]
-            verbs: ["get"]
+            verbs: ["get", "list", "watch"]
 
-  - it: omits PVC admission reads when caller driver config is disabled
+  - it: omits attachment admission reads when caller driver config is disabled
     set:
       server.drivers.kubernetes.workspaceMode: managed
     asserts:
@@ -59,6 +53,12 @@ tests:
           content:
             apiGroups: [""]
             resources: ["persistentvolumeclaims"]
+            verbs: ["get"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims", "configmaps", "secrets"]
             verbs: ["get"]
 
   - it: preserves sandbox-runtime fence permissions when gateway isolation is disabled

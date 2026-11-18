@@ -127,10 +127,23 @@ fn inventory(spec: &Value, private_secret: &str) -> Result<BTreeSet<Reference>, 
                 volume["persistentVolumeClaim"]["claimName"].as_str(),
                 Scope::Workspace,
             ),
+            "configMap" => reference(
+                &mut refs,
+                "ConfigMap",
+                volume["configMap"]["name"].as_str(),
+                Scope::Workspace,
+            ),
+            // The sandbox bootstrap Secret is gateway-managed, not a caller
+            // attachment; it skips admission like emptyDir and downwardAPI.
             "secret" if volume["secret"]["secretName"].as_str() == Some(private_secret) => {}
-            // The typed Kubernetes driver config does not expose Secret or
-            // ConfigMap volumes. The closed-set fallback rejects them instead
-            // of expanding gateway RBAC for attachments callers cannot request.
+            "secret" => reference(
+                &mut refs,
+                "Secret",
+                volume["secret"]["secretName"].as_str(),
+                Scope::Workspace,
+            ),
+            // The closed-set fallback rejects any source the typed Kubernetes
+            // driver config does not expose to callers.
             _ => return Err(deny()),
         }
     }
@@ -184,6 +197,8 @@ pub async fn admit(
     for reference in inventory(spec, private_secret)? {
         let (group, version, plural, cluster) = match reference.kind {
             "PersistentVolumeClaim" => ("", "v1", "persistentvolumeclaims", false),
+            "ConfigMap" => ("", "v1", "configmaps", false),
+            "Secret" => ("", "v1", "secrets", false),
             "RuntimeClass" => ("node.k8s.io", "v1", "runtimeclasses", true),
             "PriorityClass" => ("scheduling.k8s.io", "v1", "priorityclasses", true),
             _ => unreachable!("closed resource inventory"),
@@ -336,6 +351,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configmap_and_secret_admission_uses_resource_metadata_labels() {
+        for (kind, plural, volume) in [
+            (
+                "ConfigMap",
+                "configmaps",
+                serde_json::json!({"name":"config","configMap":{"name":"agent-config"}}),
+            ),
+            (
+                "Secret",
+                "secrets",
+                serde_json::json!({"name":"secrets","secret":{"secretName":"agent-secrets"}}),
+            ),
+        ] {
+            for (labels, allowed) in [
+                (serde_json::json!({}), false),
+                (
+                    serde_json::json!({"openshell.ai/sandbox-attachable":"true","openshell.ai/sandbox-attachable-workspace":"team-a"}),
+                    true,
+                ),
+            ] {
+                let labels = labels.clone();
+                let object_name = volume["configMap"]["name"]
+                    .as_str()
+                    .or_else(|| volume["secret"]["secretName"].as_str())
+                    .unwrap()
+                    .to_string();
+                let expected_path = format!("/api/v1/namespaces/shared/{plural}/{object_name}");
+                let service = tower::service_fn(
+                    move |request: http::Request<kube::client::Body>| {
+                        assert_eq!(request.method(), http::Method::GET);
+                        assert_eq!(request.uri().path(), expected_path);
+                        assert!(
+                            request.headers()["accept"]
+                                .to_str()
+                                .unwrap()
+                                .contains("PartialObjectMetadata")
+                        );
+                        let body = serde_json::json!({"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata",
+                            "metadata":{"name":"fixture","namespace":"shared","uid":"fixture-uid","labels":labels}});
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .header("content-type", "application/json")
+                                    .body(kube::client::Body::from(body.to_string().into_bytes()))
+                                    .unwrap(),
+                            )
+                        }
+                    },
+                );
+                let client = Client::new(service, "shared");
+                let spec = serde_json::json!({
+                    "automountServiceAccountToken": false,
+                    "volumes": [volume],
+                });
+                let result = admit(
+                    &client,
+                    &ResourceAdmissionConfig::default(),
+                    "team-a",
+                    "shared",
+                    &spec,
+                    "private",
+                )
+                .await;
+                assert_eq!(result.is_ok(), allowed, "{kind}: {result:?}");
+                if let Ok(identities) = result {
+                    assert!(
+                        identities
+                            .keys()
+                            .any(|key| key.starts_with(&format!("{kind}/shared/"))),
+                        "{kind}: {identities:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn private_bootstrap_secret_skips_admission() {
+        let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async move {
+            panic!("private bootstrap secret must not trigger an admission lookup");
+            #[allow(unreachable_code)]
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .body(kube::client::Body::from(Vec::new()))
+                    .unwrap(),
+            )
+        });
+        let client = Client::new(service, "shared");
+        let spec = serde_json::json!({
+            "automountServiceAccountToken": false,
+            "volumes": [{"name":"bootstrap","secret":{"secretName":"private"}}],
+        });
+        let identities = admit(
+            &client,
+            &ResourceAdmissionConfig::default(),
+            "team-a",
+            "shared",
+            &spec,
+            "private",
+        )
+        .await
+        .unwrap();
+        assert!(identities.is_empty());
+    }
+
+    #[tokio::test]
     async fn metadata_lookup_errors_identify_the_resource_and_failure_class() {
         for (http_status, reason, expected_code, expected_message) in [
             (
@@ -471,10 +592,13 @@ mod tests {
     }
     #[test]
     fn rejects_unsupported_volume_sources_but_allows_gpu() {
-        for kind in ["hostPath", "csi", "projected", "image", "configMap"] {
+        for kind in ["hostPath", "csi", "projected", "image"] {
             assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x",kind:{}}]}), "private").is_err());
         }
-        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"external"}}]}), "private").is_err());
+        // ConfigMap and Secret volumes are caller attachments: inventory
+        // accepts them and admission enforces operator labels on the object.
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","configMap":{"name":"external"}}]}), "private").is_ok());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"external"}}]}), "private").is_ok());
         assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"private"}}]}), "private").is_ok());
         assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"envFrom":[{"secretRef":{"name":"external"}}]}]}), "private").is_err());
         assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"env":[{"valueFrom":{"configMapKeyRef":{"name":"external"}}}]}]}), "private").is_err());
