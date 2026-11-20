@@ -610,6 +610,7 @@ discovery endpoint or its TLS CA.
 | server.credentialDrivers.vault.enabled | bool | `false` | Enable the in-tree Vault credential driver. |
 | server.credentialDrivers.vault.kubernetesAuthMount | string | `"kubernetes"` | Vault Kubernetes auth mount. |
 | server.credentialDrivers.vault.kvVersion | string | `"2"` | Default KV engine version. Use "1" or "2". |
+| server.credentialDrivers.vault.lob | string | `""` | Optional enterprise routing prefix inserted immediately after /v1/ in Vault API URLs, for example business-unit. Leave empty for standard Vault paths. |
 | server.credentialDrivers.vault.mount | string | `"secret"` | Default KV mount name. |
 | server.credentialDrivers.vault.role | string | `""` | Vault Kubernetes auth role when authMethod is kubernetes. |
 | server.credentialDrivers.vault.serviceAccountTokenPath | string | `"/var/run/secrets/kubernetes.io/serviceaccount/token"` | ServiceAccount token path used for Kubernetes auth. |

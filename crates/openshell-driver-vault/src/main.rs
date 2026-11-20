@@ -33,6 +33,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VAULT_CA_BUNDLE")]
     ca_bundle: Option<PathBuf>,
 
+    #[arg(long, env = "OPENSHELL_VAULT_LOB")]
+    lob: Option<String>,
+
     #[arg(long, env = "OPENSHELL_VAULT_MOUNT")]
     mount: Option<String>,
 
@@ -89,6 +92,7 @@ fn driver_config(args: &Args) -> toml::Table {
     let mut config = toml::Table::new();
     insert_string(&mut config, "address", args.address.as_ref());
     insert_path(&mut config, "ca_bundle", args.ca_bundle.as_ref());
+    insert_string(&mut config, "lob", args.lob.as_ref());
     insert_string(&mut config, "mount", args.mount.as_ref());
     insert_string(&mut config, "kv_version", args.kv_version.as_ref());
     insert_string(&mut config, "auth_method", args.auth_method.as_ref());

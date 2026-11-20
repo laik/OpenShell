@@ -237,7 +237,7 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- range $legacyKey, $runtimeKey := dict "address" "address" "authMethod" "auth_method" "role" "role" -}}
 {{- if not (hasKey $vaultConfig $runtimeKey) -}}{{- $_ := set $vaultConfig $runtimeKey (get $legacyVault $legacyKey) -}}{{- end -}}
 {{- end -}}
-{{- range $legacyKey, $runtimeKey := dict "mount" "mount" "kvVersion" "kv_version" "kubernetesAuthMount" "kubernetes_auth_mount" "serviceAccountTokenPath" "service_account_token_path" "tokenPath" "token_path" "timeoutSecs" "timeout_secs" -}}
+{{- range $legacyKey, $runtimeKey := dict "lob" "lob" "mount" "mount" "kvVersion" "kv_version" "kubernetesAuthMount" "kubernetes_auth_mount" "serviceAccountTokenPath" "service_account_token_path" "tokenPath" "token_path" "timeoutSecs" "timeout_secs" -}}
 {{- if and (get $legacyVault $legacyKey) (not (hasKey $vaultConfig $runtimeKey)) -}}{{- $_ := set $vaultConfig $runtimeKey (get $legacyVault $legacyKey) -}}{{- end -}}
 {{- end -}}
 {{- $_ := set $config "openshell.credential_drivers.vault" $vaultConfig -}}
