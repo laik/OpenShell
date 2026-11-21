@@ -11,6 +11,7 @@ use openshell_core::proto::credentials::v1::{
 };
 use openshell_driver_db_credstore::DbCredstoreCredentialDriver;
 use openshell_driver_kubernetes_secrets::KubernetesSecretsCredentialDriver;
+#[cfg(feature = "credential-driver-vault")]
 use openshell_driver_vault::VaultCredentialDriver;
 use tonic::Status;
 
@@ -56,6 +57,7 @@ impl CredentialDriver for DbCredstoreCredentialDriver {
     }
 }
 
+#[cfg(feature = "credential-driver-vault")]
 #[async_trait]
 impl CredentialDriver for VaultCredentialDriver {
     async fn store_credential(

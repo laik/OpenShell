@@ -129,3 +129,20 @@ run = [
   # Guard: webpki-root-certs must not appear either (webpki-roots re-exports it).
   "bash -c 'if cargo tree -p openshell-supervisor -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then echo \"ERROR: webpki-root-certs found in system CA roots build\" >&2; exit 1; fi'",
 ]
+
+["rust:verify:credential-driver-vault"]
+description = "Verify the Vault credential driver compiles out of the gateway and omitted builds reject vault config clearly"
+run = [
+  # Positive control: the default gateway must include the in-tree Vault
+  # driver, so the absence check below can never become silently vacuous.
+  "bash -c 'cargo tree -p openshell-gateway --edges normal,build --prefix none | grep -Eq \"^openshell-driver-vault v\"'",
+  # Guard: a Docker-only gateway built without the feature must not depend on
+  # the Vault driver crate.
+  "bash -c 'if cargo tree -p openshell-gateway --no-default-features --features compute-driver-docker,telemetry --edges normal,build --prefix none | grep -Eq \"^openshell-driver-vault v\"; then echo \"ERROR: openshell-driver-vault found in vault-free gateway build\" >&2; exit 1; fi'",
+  # Omitted-build behavior: vault config fails clearly, the default encrypted
+  # store and UDS transport keep working.
+  "cargo test -p openshell-credential-issuer --no-default-features",
+  # Scope to the credentials module; the substring filter would otherwise also
+  # match grpc::provider_credentials audit tests with a parallel-subscriber race.
+  "cargo test -p openshell-server --no-default-features --features telemetry --lib credentials::tests:: -- --skip grpc::",
+]

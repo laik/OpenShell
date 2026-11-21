@@ -195,7 +195,12 @@ An HTTP service DNS address fails configuration validation. `UnknownIssuer` or
 an invalid CA error means the ConfigMap is missing, the `ca.crt` key is wrong,
 or the bundle does not contain the Vault server's issuer. A hostname mismatch
 means the HTTPS `address` host is absent from the server certificate SANs; keep
-verification enabled and issue a certificate for the service DNS name.
+verification enabled and issue a certificate for the service DNS name. A
+startup error saying `credential driver 'vault' is not included in this build`
+means the gateway image was built without the default-on
+`credential-driver-vault` Cargo feature; use a default build, rebuild with the
+feature, or point the driver at an external Vault driver process with
+`transport = "uds"`.
 
 For configured gateway interceptors, inspect `[[openshell.gateway.interceptors]]`, their Unix or network endpoints, and gateway startup logs:
 
