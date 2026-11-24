@@ -4,8 +4,9 @@
 //! CLI command implementations.
 
 pub use crate::commands::common::{
-    PolicyGetView, parse_credential_expiry_cli_value, parse_env_from_pairs, parse_env_pairs,
-    parse_key_value_pairs, parse_secret_material_env_pairs, warn_credential_env_vars,
+    PolicyGetView, parse_credential_expiry_cli_value, parse_credential_ref_pairs,
+    parse_env_from_pairs, parse_env_pairs, parse_key_value_pairs, parse_secret_material_env_pairs,
+    warn_credential_env_vars,
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
@@ -7203,7 +7204,8 @@ mod tests {
     }
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::{
-        parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,
+        parse_credential_expiry_pairs, parse_credential_pairs, parse_credential_ref_pairs,
+        progress_step_from_metadata,
     };
     use crate::test_utils::Environment;
     use openshell_bootstrap::GatewayMetadata;
@@ -7389,6 +7391,15 @@ mod tests {
     fn parse_credential_pairs_accepts_key_value_form() {
         let parsed = parse_credential_pairs(&["API_KEY=abc123".to_string()]).expect("parse");
         assert_eq!(parsed.get("API_KEY"), Some(&"abc123".to_string()));
+    }
+
+    #[test]
+    fn parse_credential_ref_pairs_requires_vault_scheme() {
+        let refs = vec!["API_TOKEN=vault://secret/myapp/token#value".to_string()];
+        assert_eq!(parse_credential_ref_pairs(&refs).unwrap(), refs);
+        assert!(parse_credential_ref_pairs(&["API_TOKEN=plain-secret".to_string()]).is_err());
+        assert!(parse_credential_ref_pairs(&["API_TOKEN".to_string()]).is_err());
+        assert!(parse_credential_ref_pairs(&["=vault://secret/a#value".to_string()]).is_err());
     }
 
     #[test]

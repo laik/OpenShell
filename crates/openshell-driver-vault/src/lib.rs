@@ -31,6 +31,12 @@ const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const HANDLE_VERSION: &str = "v1";
 const STORED_VALUE_KEY: &str = "value";
 const OBJECT_ID_METADATA_KEY: &str = "openshell.storage_object_id";
+const REFERENCE_VALUE_SCHEME: &str = "vault://";
+const REFERENCE_HANDLE_PREFIX: &str = "v1:ref:";
+const REFERENCE_KV_METADATA_KEY: &str = "openshell.vault.kv_version";
+/// Non-secret handle metadata key carrying the display reference URI. The
+/// gateway surfaces it in provider reads instead of a redaction placeholder.
+pub const REFERENCE_METADATA_KEY: &str = "openshell.reference";
 
 pub struct VaultCredentialDriver {
     client: reqwest::Client,
@@ -62,6 +68,7 @@ struct VaultDriverSettings {
     api_path_prefix: Option<String>,
     mount: String,
     kv_version: KvVersion,
+    reference_path_allowlist: Vec<String>,
     auth: VaultAuthSettings,
 }
 
@@ -91,6 +98,7 @@ struct VaultDriverConfig {
     api_path_prefix: Option<String>,
     mount: Option<String>,
     kv_version: Option<String>,
+    reference_path_allowlist: Option<Vec<String>>,
     auth_method: Option<String>,
     role: Option<String>,
     kubernetes_auth_mount: Option<String>,
@@ -104,6 +112,24 @@ struct VaultSecretReference {
     api_path: String,
     key: String,
     kv_version: KvVersion,
+}
+
+/// A read-only reference to an externally managed Vault secret. `OpenShell`
+/// never writes or deletes the referenced path; the external publishing
+/// system remains the owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalVaultReference {
+    mount: String,
+    path: String,
+    field: String,
+    /// Explicit `?kv=` override; `None` uses the driver's configured version.
+    kv_version: Option<KvVersion>,
+}
+
+impl ExternalVaultReference {
+    fn logical_path(&self) -> String {
+        format!("{}/{}", self.mount, self.path)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -179,12 +205,21 @@ impl VaultCredentialDriver {
         &self,
         request: StoreCredentialRequest,
     ) -> Result<CredentialHandle, Status> {
-        let object_id = if let Some(existing_handle) = request.existing_handle.as_ref() {
+        if let Some(reference) = parse_reference_value(&request.value)? {
+            return self.store_reference(&request, &reference).await;
+        }
+        // A reference handle owns no OpenShell-stored object; replacing it
+        // with a stored value starts a fresh managed lifecycle.
+        let existing_handle = request
+            .existing_handle
+            .as_ref()
+            .filter(|handle| !is_reference_handle(handle));
+        let object_id = if let Some(existing_handle) = existing_handle {
             object_id_from_handle(existing_handle, &request.provider_id)?
         } else {
             requested_object_id(&request.object_id, &request.provider_id)?.to_string()
         };
-        let logical_path = if let Some(existing_handle) = request.existing_handle.as_ref() {
+        let logical_path = if let Some(existing_handle) = existing_handle {
             Self::logical_path_from_handle(existing_handle)?
         } else {
             managed_secret_path(
@@ -226,15 +261,80 @@ impl VaultCredentialDriver {
         })
     }
 
+    /// Persist a read-only reference without writing to Vault. The reference
+    /// URI is not secret; only the handle metadata is stored.
+    async fn store_reference(
+        &self,
+        request: &StoreCredentialRequest,
+        reference: &ExternalVaultReference,
+    ) -> Result<CredentialHandle, Status> {
+        self.validate_reference_allowed(reference)?;
+        let kv_version = reference.kv_version.unwrap_or(self.settings.kv_version);
+        // Transitioning a stored credential to a reference must not orphan
+        // the previously managed object.
+        if let Some(existing) = request
+            .existing_handle
+            .as_ref()
+            .filter(|handle| !is_reference_handle(handle))
+        {
+            self.delete_managed_handle(
+                existing,
+                &request.workspace,
+                &request.provider_id,
+                &request.provider,
+                &request.credential_key,
+            )
+            .await?;
+        }
+        let metadata = std::collections::HashMap::from([
+            (
+                REFERENCE_KV_METADATA_KEY.to_string(),
+                kv_version.config_label().to_string(),
+            ),
+            (REFERENCE_METADATA_KEY.to_string(), reference.display_uri()),
+        ]);
+        Ok(CredentialHandle {
+            driver: Self::NAME.to_string(),
+            handle: format!(
+                "{REFERENCE_HANDLE_PREFIX}{}#{}",
+                reference.logical_path(),
+                reference.field
+            ),
+            metadata,
+        })
+    }
+
     pub async fn delete_credential(&self, request: DeleteCredentialRequest) -> Result<(), Status> {
         let handle = Self::handle_from_request("delete", request.handle)?;
-        let logical_path = Self::logical_path_from_handle(&handle)?;
-        let object_id = object_id_from_handle(&handle, &request.provider_id)?;
-        validate_managed_secret_path(
+        if is_reference_handle(&handle) {
+            // The external publishing system owns the referenced secret.
+            return Ok(());
+        }
+        self.delete_managed_handle(
+            &handle,
             &request.workspace,
             &request.provider_id,
             &request.provider,
             &request.credential_key,
+        )
+        .await
+    }
+
+    async fn delete_managed_handle(
+        &self,
+        handle: &CredentialHandle,
+        workspace: &str,
+        provider_id: &str,
+        provider: &str,
+        credential_key: &str,
+    ) -> Result<(), Status> {
+        let logical_path = Self::logical_path_from_handle(handle)?;
+        let object_id = object_id_from_handle(handle, provider_id)?;
+        validate_managed_secret_path(
+            workspace,
+            provider_id,
+            provider,
+            credential_key,
             &object_id,
             &logical_path,
         )?;
@@ -254,6 +354,23 @@ impl VaultCredentialDriver {
         let mut resolved_requests = Vec::with_capacity(requests.len());
         for request in requests {
             let handle = Self::handle_from_request(&request.request_id, request.handle)?;
+            if let Some(reference) = Self::reference_from_handle(&handle)? {
+                self.validate_reference_allowed(&reference)?;
+                let kv_version = reference.kv_version.unwrap_or(self.settings.kv_version);
+                resolved_requests.push((
+                    request.request_id,
+                    VaultSecretReference {
+                        api_path: api_path_for_reference(
+                            &reference.mount,
+                            kv_version,
+                            &reference.path,
+                        ),
+                        key: reference.field,
+                        kv_version,
+                    },
+                ));
+                continue;
+            }
             let logical_path = Self::logical_path_from_handle(&handle)?;
             let object_id = object_id_from_handle(&handle, &request.provider_id)?;
             validate_managed_secret_path(
@@ -311,6 +428,42 @@ impl VaultCredentialDriver {
             .ok_or_else(|| Status::invalid_argument("vault credential handle is malformed"))?;
         validate_secret_path(logical_path).map_err(Status::invalid_argument)?;
         Ok(logical_path.to_string())
+    }
+
+    fn reference_from_handle(
+        handle: &CredentialHandle,
+    ) -> Result<Option<ExternalVaultReference>, Status> {
+        let Some(rest) = handle.handle.strip_prefix(REFERENCE_HANDLE_PREFIX) else {
+            return Ok(None);
+        };
+        let (location, field) = rest.split_once('#').ok_or_else(|| {
+            Status::invalid_argument("vault reference handle is missing '#' field separator")
+        })?;
+        let mut reference = parse_reference_location(location, field)?;
+        reference.kv_version = match handle.metadata.get(REFERENCE_KV_METADATA_KEY) {
+            Some(version) => Some(KvVersion::parse_config(version).map_err(|err| {
+                Status::invalid_argument(format!("vault reference handle metadata: {err}"))
+            })?),
+            None => None,
+        };
+        Ok(Some(reference))
+    }
+
+    /// References fail closed unless the driver explicitly allowlists the
+    /// logical `<mount>/<path>` location. Matching is segment-boundary aware
+    /// so `secret/tenant-a` never admits `secret/tenant-a-evil`.
+    fn validate_reference_allowed(&self, reference: &ExternalVaultReference) -> Result<(), Status> {
+        let logical_path = reference.logical_path();
+        let allowed =
+            self.settings.reference_path_allowlist.iter().any(|entry| {
+                logical_path == *entry || logical_path.starts_with(&format!("{entry}/"))
+            });
+        if allowed {
+            return Ok(());
+        }
+        Err(Status::permission_denied(format!(
+            "vault reference '{logical_path}' is not covered by [openshell.credential_drivers.vault] reference_path_allowlist"
+        )))
     }
 
     async fn auth_token(&self) -> Result<String, Status> {
@@ -610,6 +763,21 @@ impl VaultDriverSettings {
             .kv_version
             .as_deref()
             .map_or_else(|| Ok(KvVersion::V2), KvVersion::parse_config)?;
+        let reference_path_allowlist = config
+            .reference_path_allowlist
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| {
+                let entry = trimmed_config_string("reference_path_allowlist entry", &entry)?;
+                let entry = entry.trim_end_matches('/');
+                validate_secret_path(entry).map_err(|message| {
+                    Error::config(format!(
+                        "[openshell.credential_drivers.vault] reference_path_allowlist entry {message}"
+                    ))
+                })?;
+                Ok(entry.to_string())
+            })
+            .collect::<CoreResult<Vec<String>>>()?;
         let auth_method = config
             .auth_method
             .as_deref()
@@ -670,6 +838,7 @@ impl VaultDriverSettings {
             api_path_prefix,
             mount,
             kv_version,
+            reference_path_allowlist,
             auth,
         })
     }
@@ -685,6 +854,75 @@ impl KvVersion {
             ))),
         }
     }
+
+    fn config_label(self) -> &'static str {
+        match self {
+            Self::V1 => "1",
+            Self::V2 => "2",
+        }
+    }
+}
+
+impl ExternalVaultReference {
+    /// Canonical non-secret URI for provider reads. The `?kv=` override is
+    /// included only when the author supplied it explicitly.
+    fn display_uri(&self) -> String {
+        let kv = self.kv_version.map_or_else(String::new, |version| {
+            format!("?kv={}", version.config_label())
+        });
+        format!(
+            "{REFERENCE_VALUE_SCHEME}{}{kv}#{}",
+            self.logical_path(),
+            self.field
+        )
+    }
+}
+
+fn is_reference_handle(handle: &CredentialHandle) -> bool {
+    handle.handle.starts_with(REFERENCE_HANDLE_PREFIX)
+}
+
+/// Recognize a `vault://` reference in a credential value. `Ok(None)` means
+/// the value is an ordinary secret to store.
+fn parse_reference_value(value: &str) -> Result<Option<ExternalVaultReference>, Status> {
+    let Some(rest) = value.strip_prefix(REFERENCE_VALUE_SCHEME) else {
+        return Ok(None);
+    };
+    let (location, field) = match rest.split_once('#') {
+        Some((location, field)) => (location, field),
+        None => (rest, STORED_VALUE_KEY),
+    };
+    let (location, kv_version) = match location.split_once('?') {
+        Some((location, "kv=1")) => (location, Some(KvVersion::V1)),
+        Some((location, "kv=2")) => (location, Some(KvVersion::V2)),
+        Some((_, query)) => {
+            return Err(Status::invalid_argument(format!(
+                "vault reference query must be 'kv=1' or 'kv=2', got '{query}'"
+            )));
+        }
+        None => (location, None),
+    };
+    let mut reference = parse_reference_location(location, field)?;
+    reference.kv_version = kv_version;
+    Ok(Some(reference))
+}
+
+fn parse_reference_location(location: &str, field: &str) -> Result<ExternalVaultReference, Status> {
+    let (mount, path) = location.split_once('/').ok_or_else(|| {
+        Status::invalid_argument("vault reference must be vault://<mount>/<path>[?kv=1|2]#<field>")
+    })?;
+    validate_secret_path(mount)
+        .map_err(|message| Status::invalid_argument(format!("vault reference mount {message}")))?;
+    validate_secret_path(path)
+        .map_err(|message| Status::invalid_argument(format!("vault reference path {message}")))?;
+    validate_secret_path(field)
+        .map_err(|message| Status::invalid_argument(format!("vault reference field {message}")))?;
+    Ok(ExternalVaultReference {
+        mount: mount.to_string(),
+        path: path.to_string(),
+        field: field.to_string(),
+        kv_version: None,
+    })
 }
 
 fn vault_address(value: &str) -> CoreResult<Url> {
@@ -2239,5 +2477,378 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved[0].value, "nvapi-test");
+    }
+
+    fn reference_driver(
+        uri: &str,
+        token_path: &Path,
+        allowlist: &[&str],
+        api_path_prefix: Option<&str>,
+    ) -> VaultCredentialDriver {
+        let mut config = table(&[
+            ("address", toml::Value::String(uri.to_string())),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token_path.display().to_string()),
+            ),
+            (
+                "reference_path_allowlist",
+                toml::Value::Array(
+                    allowlist
+                        .iter()
+                        .map(|entry| toml::Value::String((*entry).to_string()))
+                        .collect(),
+                ),
+            ),
+        ]);
+        if let Some(prefix) = api_path_prefix {
+            config.insert(
+                "api_path_prefix".to_string(),
+                toml::Value::String(prefix.to_string()),
+            );
+        }
+        VaultCredentialDriver::from_config(&config).unwrap()
+    }
+
+    fn reference_store_request(value: &str) -> StoreCredentialRequest {
+        StoreCredentialRequest {
+            provider: "corp-api".to_string(),
+            credential_key: "API_TOKEN".to_string(),
+            value: value.to_string(),
+            existing_handle: None,
+            workspace: "default".to_string(),
+            provider_id: "prov-123".to_string(),
+            object_id: "prov-123".to_string(),
+        }
+    }
+
+    fn reference_resolve_request(handle: CredentialHandle) -> ResolveCredentialRequest {
+        ResolveCredentialRequest {
+            request_id: "credential-0".to_string(),
+            provider: "corp-api".to_string(),
+            credential_key: "API_TOKEN".to_string(),
+            handle: Some(handle),
+            workspace: "default".to_string(),
+            provider_id: "prov-123".to_string(),
+        }
+    }
+
+    #[test]
+    fn reference_value_parsing() {
+        let plain = parse_reference_value("nvapi-secret").unwrap();
+        assert!(plain.is_none());
+
+        let reference = parse_reference_value("vault://secret/myapp/token#value")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reference.mount, "secret");
+        assert_eq!(reference.path, "myapp/token");
+        assert_eq!(reference.field, "value");
+        assert_eq!(reference.kv_version, None);
+        assert_eq!(reference.display_uri(), "vault://secret/myapp/token#value");
+
+        let defaulted = parse_reference_value("vault://secret/myapp/token")
+            .unwrap()
+            .unwrap();
+        assert_eq!(defaulted.field, STORED_VALUE_KEY);
+
+        let kv1 = parse_reference_value("vault://kv/legacy/app?kv=1#token")
+            .unwrap()
+            .unwrap();
+        assert_eq!(kv1.kv_version, Some(KvVersion::V1));
+        assert_eq!(kv1.display_uri(), "vault://kv/legacy/app?kv=1#token");
+
+        for invalid in [
+            "vault://",
+            "vault://secret",
+            "vault://secret/../escape#value",
+            "vault://secret/myapp/token#value?kv=3",
+            "vault://secret/myapp/token?kv=9#value",
+            "vault://secret/myapp/token#",
+            "vault://secret//double#value",
+        ] {
+            assert!(
+                parse_reference_value(invalid).is_err(),
+                "expected rejection of {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_allowlist_config_validation() {
+        let token = token_file("dev-token");
+        let mut config = table(&[
+            (
+                "address",
+                toml::Value::String("http://127.0.0.1:8200".to_string()),
+            ),
+            ("auth_method", toml::Value::String("token_file".to_string())),
+            (
+                "token_path",
+                toml::Value::String(token.path().display().to_string()),
+            ),
+        ]);
+        config.insert(
+            "reference_path_allowlist".to_string(),
+            toml::Value::Array(vec![toml::Value::String("../evil/".to_string())]),
+        );
+        assert!(VaultCredentialDriver::from_config(&config).is_err());
+
+        config.insert(
+            "reference_path_allowlist".to_string(),
+            toml::Value::Array(vec![toml::Value::String("secret/tenant-a/".to_string())]),
+        );
+        let driver = VaultCredentialDriver::from_config(&config).unwrap();
+        assert_eq!(
+            driver.settings.reference_path_allowlist,
+            ["secret/tenant-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn store_reference_writes_nothing_and_resolve_follows_rotation() {
+        let mock_server = MockServer::start().await;
+        // Any write or delete against the mock is a test failure.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let api_path = "/v1/bu-a/secret/data/myapp/token";
+        Mock::given(method("GET"))
+            .and(path(api_path))
+            .and(header("x-vault-token", "dev-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "data": { "value": "published-v1" } }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(api_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "data": { "value": "published-v2" } }
+            })))
+            .mount(&mock_server)
+            .await;
+        let token = token_file("dev-token\n");
+        let driver = reference_driver(
+            &mock_server.uri(),
+            token.path(),
+            &["secret/myapp/"],
+            Some("bu-a"),
+        );
+
+        let stored = driver
+            .store_credential(reference_store_request("vault://secret/myapp/token#value"))
+            .await
+            .unwrap();
+        assert_eq!(stored.handle, "v1:ref:secret/myapp/token#value");
+        assert_eq!(
+            stored.metadata.get(REFERENCE_METADATA_KEY).unwrap(),
+            "vault://secret/myapp/token#value"
+        );
+        assert_eq!(stored.metadata.get(REFERENCE_KV_METADATA_KEY).unwrap(), "2");
+
+        let first = driver
+            .resolve_credentials(vec![reference_resolve_request(stored.clone())])
+            .await
+            .unwrap();
+        assert_eq!(first[0].value, "published-v1");
+
+        // The external system rotates; the next supply reads through live.
+        let second = driver
+            .resolve_credentials(vec![reference_resolve_request(stored)])
+            .await
+            .unwrap();
+        assert_eq!(second[0].value, "published-v2");
+    }
+
+    #[tokio::test]
+    async fn reference_kv1_override_reads_v1_layout() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/kv/legacy/app"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "token": "legacy-value" }
+            })))
+            .mount(&mock_server)
+            .await;
+        let token = token_file("dev-token\n");
+        let driver = reference_driver(&mock_server.uri(), token.path(), &["kv/legacy"], None);
+
+        let stored = driver
+            .store_credential(reference_store_request("vault://kv/legacy/app?kv=1#token"))
+            .await
+            .unwrap();
+        assert_eq!(stored.metadata.get(REFERENCE_KV_METADATA_KEY).unwrap(), "1");
+
+        let resolved = driver
+            .resolve_credentials(vec![reference_resolve_request(stored)])
+            .await
+            .unwrap();
+        assert_eq!(resolved[0].value, "legacy-value");
+    }
+
+    #[tokio::test]
+    async fn store_reference_fails_closed_without_allowlist() {
+        let mock_server = MockServer::start().await;
+        let token = token_file("dev-token\n");
+        let driver = reference_driver(&mock_server.uri(), token.path(), &[], None);
+
+        let error = driver
+            .store_credential(reference_store_request("vault://secret/myapp/token#value"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::PermissionDenied);
+        assert!(error.message().contains("reference_path_allowlist"));
+
+        // Segment-boundary matching: an allowlisted sibling prefix must not
+        // admit a differently named path.
+        let driver = reference_driver(&mock_server.uri(), token.path(), &["secret/tenant-a"], None);
+        let error = driver
+            .store_credential(reference_store_request(
+                "vault://secret/tenant-a-evil/token#value",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn resolve_reference_missing_path_or_field_fails_closed() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/data/myapp/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/data/myapp/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "data": { "other": "x" } }
+            })))
+            .mount(&mock_server)
+            .await;
+        let token = token_file("dev-token\n");
+        let driver = reference_driver(&mock_server.uri(), token.path(), &["secret/myapp"], None);
+
+        let missing_path = driver
+            .store_credential(reference_store_request(
+                "vault://secret/myapp/missing#value",
+            ))
+            .await
+            .unwrap();
+        let error = driver
+            .resolve_credentials(vec![reference_resolve_request(missing_path)])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::NotFound);
+
+        let missing_field = driver
+            .store_credential(reference_store_request("vault://secret/myapp/token#value"))
+            .await
+            .unwrap();
+        let error = driver
+            .resolve_credentials(vec![reference_resolve_request(missing_field)])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::NotFound);
+        assert!(error.message().contains("value"));
+    }
+
+    #[tokio::test]
+    async fn delete_reference_never_touches_external_secret() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let token = token_file("dev-token\n");
+        let driver = reference_driver(&mock_server.uri(), token.path(), &["secret/myapp"], None);
+        let stored = driver
+            .store_credential(reference_store_request("vault://secret/myapp/token#value"))
+            .await
+            .unwrap();
+
+        driver
+            .delete_credential(DeleteCredentialRequest {
+                provider: "corp-api".to_string(),
+                credential_key: "API_TOKEN".to_string(),
+                handle: Some(stored),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stored_to_reference_transition_deletes_managed_object() {
+        let mock_server = MockServer::start().await;
+        let logical_path =
+            managed_secret_path("default", "prov-123", "corp-api", "API_TOKEN", "prov-123");
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1/secret/metadata/{logical_path}")))
+            .and(header("x-vault-token", "dev-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let token = token_file("dev-token\n");
+        let driver = reference_driver(&mock_server.uri(), token.path(), &["secret/myapp"], None);
+
+        let mut request = reference_store_request("vault://secret/myapp/token#value");
+        request.existing_handle = Some(handle(&format!("v1:{logical_path}")));
+        let stored = driver.store_credential(request).await.unwrap();
+        assert_eq!(stored.handle, "v1:ref:secret/myapp/token#value");
+    }
+
+    #[tokio::test]
+    async fn reference_to_stored_transition_starts_managed_lifecycle() {
+        let mock_server = MockServer::start().await;
+        let logical_path =
+            managed_secret_path("default", "prov-123", "corp-api", "API_TOKEN", "prov-123");
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/secret/data/{logical_path}")))
+            .and(body_string_contains("now-stored"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let token = token_file("dev-token\n");
+        let driver = reference_driver(&mock_server.uri(), token.path(), &["secret/myapp"], None);
+
+        let mut request = reference_store_request("now-stored");
+        request.existing_handle = Some(handle("v1:ref:secret/myapp/token#value"));
+        let stored = driver.store_credential(request).await.unwrap();
+        assert_eq!(stored.handle, format!("v1:{logical_path}"));
+    }
+
+    #[tokio::test]
+    async fn resolve_reference_rechecks_allowlist() {
+        let mock_server = MockServer::start().await;
+        let token = token_file("dev-token\n");
+        let permissive =
+            reference_driver(&mock_server.uri(), token.path(), &["secret/myapp"], None);
+        let stored = permissive
+            .store_credential(reference_store_request("vault://secret/myapp/token#value"))
+            .await
+            .unwrap();
+
+        // Operator narrows the allowlist; existing references fail closed.
+        let narrowed = reference_driver(&mock_server.uri(), token.path(), &["secret/other"], None);
+        let error = narrowed
+            .resolve_credentials(vec![reference_resolve_request(stored)])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::PermissionDenied);
     }
 }

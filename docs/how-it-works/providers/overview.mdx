@@ -63,6 +63,25 @@ openshell provider create --name my-nvidia --type nvidia --credential NVIDIA_API
 
 This looks up the current value of `$NVIDIA_API_KEY` in your shell and stores it.
 
+### With Read-Only Vault References
+
+When an external system publishes and rotates secrets in HashiCorp Vault,
+reference the existing path instead of copying the value into OpenShell:
+
+```shell
+openshell provider create --name corp-api --type corp-api \
+  --credential-ref API_TOKEN=vault://secret/myapp/token#value
+```
+
+The gateway reads the current Vault value each time it supplies the credential
+to a sandbox, so external rotations take effect without operator action.
+OpenShell never writes or deletes the referenced secret, and deleting the
+provider removes only the reference. `provider get` shows the reference
+location, not the value. The gateway's Vault driver must allowlist the
+location through `reference_path_allowlist`; see
+[Gateway configuration](/how-it-works/gateways/configuration). References
+require the Vault credential driver.
+
 ### From the Current OIDC Login
 
 Profile-backed token-exchange providers can store the current gateway OIDC

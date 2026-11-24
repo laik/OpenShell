@@ -42,6 +42,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VAULT_KV_VERSION")]
     kv_version: Option<String>,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_VAULT_REFERENCE_PATH_ALLOWLIST",
+        value_delimiter = ','
+    )]
+    reference_path_allowlist: Option<Vec<String>>,
+
     #[arg(long, env = "OPENSHELL_VAULT_AUTH_METHOD")]
     auth_method: Option<String>,
 
@@ -99,6 +106,17 @@ fn driver_config(args: &Args) -> toml::Table {
     );
     insert_string(&mut config, "mount", args.mount.as_ref());
     insert_string(&mut config, "kv_version", args.kv_version.as_ref());
+    if let Some(entries) = args.reference_path_allowlist.as_ref() {
+        config.insert(
+            "reference_path_allowlist".to_string(),
+            toml::Value::Array(
+                entries
+                    .iter()
+                    .map(|entry| toml::Value::String(entry.clone()))
+                    .collect(),
+            ),
+        );
+    }
     insert_string(&mut config, "auth_method", args.auth_method.as_ref());
     insert_string(&mut config, "role", args.role.as_ref());
     insert_string(

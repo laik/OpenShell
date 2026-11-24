@@ -57,11 +57,15 @@ pub(super) fn redact_provider_credentials(mut provider: Provider) -> Provider {
     for value in provider.credentials.values_mut() {
         *value = "REDACTED".to_string();
     }
-    for key in provider.credential_handles.keys() {
-        provider
-            .credentials
-            .entry(key.clone())
-            .or_insert_with(|| "REDACTED".to_string());
+    for (key, handle) in &provider.credential_handles {
+        // Read-only external references are not secret; show the reference
+        // location instead of a redaction placeholder.
+        let display = handle
+            .metadata
+            .get(openshell_driver_vault::REFERENCE_METADATA_KEY)
+            .cloned()
+            .unwrap_or_else(|| "REDACTED".to_string());
+        provider.credentials.entry(key.clone()).or_insert(display);
     }
     provider.credential_handles.clear();
     provider
@@ -5555,6 +5559,42 @@ mod tests {
 
     fn ts(milliseconds: i64) -> prost_types::Timestamp {
         openshell_core::time::timestamp_from_millis(milliseconds).unwrap()
+    }
+
+    #[test]
+    fn redaction_shows_external_reference_but_hides_stored_values() {
+        let mut provider = Provider {
+            credentials: HashMap::from([("STORED_KEY".to_string(), "secret".to_string())]),
+            credential_handles: HashMap::from([
+                (
+                    "STORED_KEY".to_string(),
+                    CredentialHandle {
+                        driver: "vault".to_string(),
+                        handle: "v1:openshell/provider-credentials/abc".to_string(),
+                        metadata: HashMap::new(),
+                    },
+                ),
+                (
+                    "REFERENCED_KEY".to_string(),
+                    CredentialHandle {
+                        driver: "vault".to_string(),
+                        handle: "v1:ref:secret/myapp/token#value".to_string(),
+                        metadata: HashMap::from([(
+                            openshell_driver_vault::REFERENCE_METADATA_KEY.to_string(),
+                            "vault://secret/myapp/token#value".to_string(),
+                        )]),
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        provider = redact_provider_credentials(provider);
+        assert_eq!(provider.credentials.get("STORED_KEY").unwrap(), "REDACTED");
+        assert_eq!(
+            provider.credentials.get("REFERENCED_KEY").unwrap(),
+            "vault://secret/myapp/token#value"
+        );
+        assert!(provider.credential_handles.is_empty());
     }
 
     #[test]

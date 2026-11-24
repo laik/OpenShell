@@ -849,7 +849,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(false).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(false).multiple(true).args(["from_existing", "credentials", "credential_refs", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -874,6 +874,16 @@ enum ProviderCommands {
             conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"]
         )]
         credentials: Vec<String>,
+
+        /// Reference an externally managed Vault secret read-only
+        /// (`KEY=vault://<mount>/<path>[?kv=1|2]#<field>`). The gateway reads
+        /// the current value at supply time and never writes the secret.
+        #[arg(
+            long = "credential-ref",
+            value_name = "KEY=VAULT_REF",
+            conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]
+        )]
+        credential_refs: Vec<String>,
 
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
@@ -977,6 +987,15 @@ enum ProviderCommands {
             conflicts_with = "from_existing"
         )]
         credentials: Vec<String>,
+
+        /// Reference an externally managed Vault secret read-only
+        /// (`KEY=vault://<mount>/<path>[?kv=1|2]#<field>`).
+        #[arg(
+            long = "credential-ref",
+            value_name = "KEY=VAULT_REF",
+            conflicts_with_all = ["from_existing", "from_oidc_token"]
+        )]
+        credential_refs: Vec<String>,
 
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
@@ -3929,13 +3948,15 @@ async fn run_async() -> Result<()> {
                     provider_type,
                     labels,
                     from_existing,
-                    credentials,
+                    mut credentials,
+                    credential_refs,
                     from_gcloud_adc,
                     from_oidc_token,
                     runtime_credentials,
                     config,
                     global_profile,
                 } => {
+                    credentials.extend(run::parse_credential_ref_pairs(&credential_refs)?);
                     let profile_ws = if global_profile { "" } else { &cli.workspace };
                     let credential_source = if from_existing {
                         run::ProviderCreateCredentialSource::Existing
@@ -4070,11 +4091,13 @@ async fn run_async() -> Result<()> {
                     name,
                     from_existing,
                     from_oidc_token,
-                    credentials,
+                    mut credentials,
+                    credential_refs,
                     config,
                     credential_expires_at,
                     readiness,
                 } => {
+                    credentials.extend(run::parse_credential_ref_pairs(&credential_refs)?);
                     run::provider_update(run::ProviderUpdateOptions {
                         server: endpoint,
                         name: &name,

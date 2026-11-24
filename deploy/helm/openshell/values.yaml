@@ -595,6 +595,8 @@ server:
       mount: secret
       # -- Default KV engine version. Use "1" or "2".
       kvVersion: "2"
+      # -- Path prefixes (mount/path) that read-only vault:// credential references may target, for example ["secret/tenant-a/"]. Empty = references rejected.
+      referencePathAllowlist: []
       # -- Authentication method. Use "kubernetes" in-cluster or "token_file" for local/dev validation.
       authMethod: kubernetes
       # -- Vault Kubernetes auth role when authMethod is kubernetes.

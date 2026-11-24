@@ -1022,6 +1022,27 @@ pub fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String
     Ok(map)
 }
 
+/// Validate `--credential-ref KEY=vault://...` pairs.
+///
+/// References flow through the same credential map as stored values; the
+/// gateway recognizes the `vault://` scheme and persists a read-only handle
+/// instead of a secret.
+pub fn parse_credential_ref_pairs(items: &[String]) -> Result<Vec<String>> {
+    for item in items {
+        let Some((key, value)) = item.split_once('=') else {
+            return Err(miette::miette!(
+                "--credential-ref requires KEY=vault://<mount>/<path>[?kv=1|2]#<field>"
+            ));
+        };
+        if key.trim().is_empty() || !value.starts_with("vault://") {
+            return Err(miette::miette!(
+                "--credential-ref {key} must reference vault://<mount>/<path>[?kv=1|2]#<field>"
+            ));
+        }
+    }
+    Ok(items.to_vec())
+}
+
 pub fn parse_credential_expiry_cli_value(value: &str) -> std::result::Result<i64, String> {
     parse_credential_expiry_value(value, None).map_err(|err| err.to_string())
 }

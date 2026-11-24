@@ -1392,13 +1392,21 @@ pub async fn provider_get(
         "Resource version:".dimmed(),
         provider.metadata.as_ref().map_or(0, |m| m.resource_version)
     );
+    // Read-only vault:// references are not secret; show their location.
+    let credential_display = credential_keys
+        .iter()
+        .map(|key| match provider.credentials.get(key) {
+            Some(value) if value.starts_with("vault://") => format!("{key}={value}"),
+            _ => key.clone(),
+        })
+        .collect::<Vec<_>>();
     println!(
         "  {} {}",
         "Credential keys:".dimmed(),
-        if credential_keys.is_empty() {
+        if credential_display.is_empty() {
             "<none>".to_string()
         } else {
-            credential_keys.join(", ")
+            credential_display.join(", ")
         }
     );
     println!(

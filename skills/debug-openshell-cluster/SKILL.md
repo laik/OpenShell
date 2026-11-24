@@ -194,6 +194,12 @@ Vault API URL, for example `/v1/business-unit/auth/kubernetes/login`. If the
 platform routes by path prefix and login or KV requests return 404, check that
 `api_path_prefix` matches the platform's prefix; omit it for standard Vault paths.
 
+Read-only `vault://` credential references fail closed with `permission_denied`
+when `reference_path_allowlist` does not cover the referenced `<mount>/<path>`.
+Check the allowlist entries match at path-segment boundaries and that the
+external secret exists and is readable by the driver's Vault role; a missing
+path or field fails credential supply with `not_found`.
+
 For configured gateway interceptors, inspect `[[openshell.gateway.interceptors]]`, their Unix or network endpoints, and gateway startup logs:
 
 ```bash
