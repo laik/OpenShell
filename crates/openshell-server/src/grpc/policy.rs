@@ -1985,7 +1985,7 @@ async fn current_effective_policy_from_records(
     catalog: &EffectiveProviderProfileCatalog,
     sandbox: &Sandbox,
     sandbox_id: &str,
-    records: &[super::provider::ProviderEnvironmentRecord],
+    records: &[crate::grpc::provider::ProviderEnvironmentRecord],
 ) -> Result<(ProtoSandboxPolicy, PolicySource), Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let global_policy = decode_policy_from_global_settings(&global_settings)?;
@@ -2011,7 +2011,7 @@ async fn current_effective_policy_from_records(
 /// store reads. A missing policy composes provider layers onto an empty one.
 fn effective_policy_from_captured_inputs(
     catalog: &EffectiveProviderProfileCatalog,
-    records: &[super::provider::ProviderEnvironmentRecord],
+    records: &[crate::grpc::provider::ProviderEnvironmentRecord],
     global_policy: Option<ProtoSandboxPolicy>,
     latest_policy: Option<&PolicyRecord>,
     sandbox: &Sandbox,
@@ -2225,7 +2225,7 @@ pub(super) fn policy_has_credential_binding_for_provider(
 
 fn validate_policy_credential_binding_context(
     catalog: &EffectiveProviderProfileCatalog,
-    records: &[super::provider::ProviderEnvironmentRecord],
+    records: &[crate::grpc::provider::ProviderEnvironmentRecord],
     policy: &ProtoSandboxPolicy,
     bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
 ) -> Result<(), Status> {
@@ -2264,7 +2264,7 @@ const SIGV4_REQUIRED_CREDENTIAL_KEYS: [&str; 2] = ["AWS_ACCESS_KEY_ID", "AWS_SEC
 
 fn validate_policy_signing_credential_sources(
     catalog: &EffectiveProviderProfileCatalog,
-    records: &[super::provider::ProviderEnvironmentRecord],
+    records: &[crate::grpc::provider::ProviderEnvironmentRecord],
     policy: &ProtoSandboxPolicy,
 ) -> Result<(), Status> {
     for rule in policy.network_policies.values() {
@@ -2311,7 +2311,7 @@ fn validate_policy_signing_credential_sources(
 
 fn signing_profile_for_record(
     catalog: &EffectiveProviderProfileCatalog,
-    record: &super::provider::ProviderEnvironmentRecord,
+    record: &crate::grpc::provider::ProviderEnvironmentRecord,
 ) -> Option<openshell_providers::ProviderTypeProfile> {
     super::provider::get_provider_type_profile_for_scope(
         catalog,
@@ -3077,6 +3077,9 @@ pub async fn build_sandbox_config_snapshot_from_inputs(
             .as_ref()
             .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
+    let provider_env_revision =
+        mix_external_reference_values(&state.credentials, provider_records, provider_env_revision)
+            .await?;
 
     let service_routes = super::service::configured_app_routes(state, sandbox).await?;
     // Include the allowlist in delivery identity so a service edit is not
@@ -3362,7 +3365,7 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
 #[cfg(test)]
 fn compute_provider_env_revision_from_records(
     catalog: &EffectiveProviderProfileCatalog,
-    records: &[super::provider::ProviderEnvironmentRecord],
+    records: &[crate::grpc::provider::ProviderEnvironmentRecord],
 ) -> Result<u64, Status> {
     compute_provider_env_revision_from_records_and_policy_bindings(
         catalog,
@@ -3374,7 +3377,7 @@ fn compute_provider_env_revision_from_records(
 
 fn compute_provider_env_revision_from_records_and_policy_bindings(
     catalog: &EffectiveProviderProfileCatalog,
-    records: &[super::provider::ProviderEnvironmentRecord],
+    records: &[crate::grpc::provider::ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
     global_policy: Option<&ProtoSandboxPolicy>,
 ) -> Result<u64, Status> {
@@ -3423,6 +3426,73 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     let digest = hasher.finalize();
     Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
         |_| Status::internal("provider env revision digest too short"),
+    )?))
+}
+
+/// Read-only external references change value without touching the provider
+/// record, so their resolved values must participate in the revision the
+/// supervisor polls; otherwise external rotations are never re-fetched.
+/// Providers without references keep the base revision unchanged.
+async fn mix_external_reference_values(
+    credentials: &crate::credentials::CredentialRuntime,
+    records: &[crate::grpc::provider::ProviderEnvironmentRecord],
+    base_revision: u64,
+) -> Result<u64, Status> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-provider-env-external-refs-v1");
+    hasher.update(base_revision.to_le_bytes());
+    let mut has_references = false;
+    for record in records {
+        let reference_handles: HashMap<String, openshell_core::proto::CredentialHandle> = record
+            .provider
+            .credential_handles
+            .iter()
+            .filter(|(_, handle)| {
+                handle
+                    .metadata
+                    .contains_key(openshell_driver_vault::REFERENCE_METADATA_KEY)
+            })
+            .map(|(key, handle)| (key.clone(), handle.clone()))
+            .collect();
+        if reference_handles.is_empty() {
+            continue;
+        }
+        has_references = true;
+        let mut reference_provider = record.provider.clone();
+        reference_provider.credential_handles = reference_handles;
+        hasher.update(record.name.as_bytes());
+        match credentials
+            .resolve_provider_handles(&reference_provider, openshell_core::time::now_ms())
+            .await
+        {
+            Ok(resolved) => {
+                let mut keys: Vec<_> = resolved.values.keys().collect();
+                keys.sort();
+                for key in keys {
+                    hasher.update(key.as_bytes());
+                    hasher.update(resolved.values[key].as_bytes());
+                }
+                let mut expired: Vec<_> = resolved.expired_keys.iter().collect();
+                expired.sort();
+                for key in expired {
+                    hasher.update(key.as_bytes());
+                    hasher.update(b"expired");
+                }
+            }
+            Err(err) => {
+                // Fail closed: a changed error still bumps the revision so the
+                // supervisor re-fetches and revokes instead of serving stale.
+                hasher.update(b"resolve-error");
+                hasher.update(err.message().as_bytes());
+            }
+        }
+    }
+    if !has_references {
+        return Ok(base_revision);
+    }
+    let digest = hasher.finalize();
+    Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
+        |_| Status::internal("provider env external reference digest too short"),
     )?))
 }
 
@@ -3543,7 +3613,7 @@ async fn provider_policy_context_with_catalog(
 
 fn provider_policy_context_from_records(
     catalog: &EffectiveProviderProfileCatalog,
-    records: &[super::provider::ProviderEnvironmentRecord],
+    records: &[crate::grpc::provider::ProviderEnvironmentRecord],
 ) -> ProviderPolicyContext {
     let mut layers = Vec::new();
     let mut credentialed_scopes = Vec::new();
@@ -3885,9 +3955,10 @@ struct ProviderEnvironmentTarget<'a> {
     provider_env_revision: u64,
 }
 
-fn provider_environment_target(
-    inputs: &SandboxConfigInputs,
-) -> Result<ProviderEnvironmentTarget<'_>, Status> {
+async fn provider_environment_target<'a>(
+    inputs: &'a SandboxConfigInputs,
+    credentials: &crate::credentials::CredentialRuntime,
+) -> Result<ProviderEnvironmentTarget<'a>, Status> {
     let sandbox = &inputs.sandbox;
     let spec = sandbox
         .spec
@@ -3916,6 +3987,8 @@ fn provider_environment_target(
         &policy_credential_bindings,
         matches!(policy_source, PolicySource::Global).then_some(&effective_policy),
     )?;
+    let provider_env_revision =
+        mix_external_reference_values(credentials, provider_records, provider_env_revision).await?;
     Ok(ProviderEnvironmentTarget {
         spec,
         effective_policy,
@@ -3940,7 +4013,7 @@ pub async fn build_provider_environment_snapshot_from_inputs(
         policy_source,
         policy_credential_bindings,
         provider_env_revision,
-    } = provider_environment_target(inputs)?;
+    } = provider_environment_target(inputs, &state.credentials).await?;
 
     let provider_names = &spec.providers;
     let provider_profile_catalog = &inputs.catalog;
@@ -7506,7 +7579,7 @@ struct AtomicPolicyWriteContext<'a> {
 
 struct PolicyCredentialBindingValidationContext<'a> {
     catalog: &'a EffectiveProviderProfileCatalog,
-    records: &'a [super::provider::ProviderEnvironmentRecord],
+    records: &'a [crate::grpc::provider::ProviderEnvironmentRecord],
     credentialed_scopes: &'a [CredentialedEndpointScope],
     endpointless_provider_names: &'a HashSet<String>,
 }
@@ -7514,7 +7587,7 @@ struct PolicyCredentialBindingValidationContext<'a> {
 struct SandboxPolicyMergeValidationData {
     provider_layers: Vec<ProviderPolicyLayer>,
     catalog: EffectiveProviderProfileCatalog,
-    records: Vec<super::provider::ProviderEnvironmentRecord>,
+    records: Vec<crate::grpc::provider::ProviderEnvironmentRecord>,
     credentialed_scopes: Vec<CredentialedEndpointScope>,
     endpointless_provider_names: HashSet<String>,
 }
@@ -15540,6 +15613,85 @@ mod tests {
         assert_ne!(
             first, second,
             "custom provider profile updates must trigger sandbox dynamic credential refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_reference_rotation_changes_provider_env_revision() {
+        let runtime = crate::credentials::CredentialRuntime::from_config(
+            &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
+        let mut provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "prov-1".to_string(),
+                name: "corp-ref".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let stored = runtime
+            .store_provider_credentials(
+                "corp-ref",
+                "default",
+                "prov-1",
+                &HashMap::from([("API_TOKEN".to_string(), "published-v1".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let mut handle = stored["API_TOKEN"].clone();
+        handle.metadata.insert(
+            openshell_driver_vault::REFERENCE_METADATA_KEY.to_string(),
+            "vault://secret/myapp/token#value".to_string(),
+        );
+        provider.credential_handles = HashMap::from([("API_TOKEN".to_string(), handle)]);
+        let record = crate::grpc::provider::ProviderEnvironmentRecord {
+            name: "corp-ref".to_string(),
+            object_id: "prov-1".to_string(),
+            resource_version: 1,
+            provider: provider.clone(),
+            refresh_states: vec![],
+        };
+        let base = 42_u64;
+        let first = mix_external_reference_values(&runtime, &[record.clone()], base)
+            .await
+            .unwrap();
+        assert_ne!(
+            first, base,
+            "reference values must participate in the revision"
+        );
+
+        // External rotation: same handle, new value, provider record unchanged.
+        runtime
+            .store_provider_credentials(
+                "corp-ref",
+                "default",
+                "prov-1",
+                &HashMap::from([("API_TOKEN".to_string(), "published-v2".to_string())]),
+                &provider.credential_handles,
+            )
+            .await
+            .unwrap();
+        let second = mix_external_reference_values(&runtime, &[record.clone()], base)
+            .await
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "external rotation must bump the revision without a provider record change"
+        );
+
+        let plain = crate::grpc::provider::ProviderEnvironmentRecord {
+            provider: Provider::default(),
+            ..record
+        };
+        assert_eq!(
+            mix_external_reference_values(&runtime, &[plain], base)
+                .await
+                .unwrap(),
+            base,
+            "providers without references keep the base revision"
         );
     }
 

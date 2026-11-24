@@ -73,8 +73,9 @@ openshell provider create --name corp-api --type corp-api \
   --credential-ref API_TOKEN=vault://secret/myapp/token#value
 ```
 
-The gateway reads the current Vault value each time it supplies the credential
-to a sandbox, so external rotations take effect without operator action.
+The gateway reads the current Vault value when supplying the credential to a
+sandbox; external rotations reach running sandboxes within the supervisor
+settings poll interval (default 10 seconds), without operator action.
 OpenShell never writes or deletes the referenced secret, and deleting the
 provider removes only the reference. `provider get` shows the reference
 location, not the value. The gateway's Vault driver must allowlist the
